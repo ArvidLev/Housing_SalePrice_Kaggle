@@ -1,0 +1,259 @@
+---
+title: "House Prices Kaggle"
+output: html_notebook
+---
+Load all the packages needed
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(skimr)
+library(parsnip)
+library(ranger)
+library(yardstick)
+library(glmnet)
+library(earth)
+```
+Load the data sets
+```{r}
+setwd("~/R projects/House Prices")
+train <- read_csv("train.csv")
+test <- read_csv("test.csv")
+```
+EDA
+Lets look at how the SalePrices are distributed
+```{r}
+ggplot(train,
+       aes(x = SalePrice)) +
+  geom_histogram(fill = "white", color = "black")
+```
+I don't like the shape of the distribution of SalePrice so lets try making it look more symmetric with a log transformation.
+```{r}
+ggplot(train, aes(x = log(SalePrice))) +
+  geom_histogram(fill = "white", color = "black")
+```
+This is much better. We could try more kinds of transformations like inverse, power or BoxCox but I think this looks good enough.
+However, lets do the transformation and then remove observations that have a boxplot's definition of outlier for SalePrice. 
+
+```{r}
+train$SalePrice <- log(train$SalePrice)
+sale_upper <- boxplot(train$SalePrice)$stats[5]
+sale_lower <- boxplot(train$SalePrice)$stats[1]
+train <- train %>%
+  filter(SalePrice < sale_upper, SalePrice > sale_lower)
+```
+Lets check some other features and their relationship to SalePrice
+```{r}
+ggplot(train,
+       aes(y = SalePrice,
+           group = OverallQual)) +
+  geom_boxplot()
+```
+```{r}
+ggplot(train,
+       aes(y = SalePrice,
+           x = LotArea)) +
+  geom_point()
+```
+Data Cleaning
+
+Now it is time to clean our datasets.
+For this I combine the train and test dataset.
+I am going to remove columns which have more that 25% missing values.
+Also I remove Street and Utilties because they have a very small variance.
+```{r}
+test$SalePrice <- 0
+full <- rbind(test, train)
+skim(full)
+remove_cols <- colnames(full)[colSums(is.na(full)) > (0.25 * nrow(full))]
+full <- full %>%
+  select(!remove_cols)
+full <- full %>%
+  select(!c(Street, Utilities))
+
+train <- full %>%
+  filter(SalePrice != 0)
+test <- full %>%
+  filter(SalePrice == 0)
+```
+
+
+Now we split the training data
+```{r}
+set.seed(135)
+data_split <- initial_split(train, strata = "SalePrice", prop = 0.80)
+
+house_test <- testing(data_split)
+house_train <- training(data_split)
+```
+
+Here I am doing all the preprocessing.
+```{r}
+house_rec <- recipe(SalePrice ~., data = house_train) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  update_role(Id, new_role = "ID") %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_impute_median(all_predictors()) %>%
+  step_BoxCox(all_numeric_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+Modeling
+
+For some of the models I will be tuning the hyperparameters and will be doing so using a 5-fold crossvalidation.
+```{r}
+set.seed(123)
+folds <- vfold_cv(house_train, v = 5)
+```
+
+Random Forest Model - Model
+```{r}
+rf_mod <-
+  rand_forest(trees = 1000, mtry = tune(), min_n = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("ranger")
+```
+
+
+Random Forest - Workflow
+```{r}
+rf_wf <- workflow() %>%
+  add_recipe(house_rec) %>%
+  add_model(rf_mod)
+```
+
+
+Random Forest - Grid for tuning
+```{r}
+rf_grid <- grid_regular(
+  mtry(range = c(10, 30)),
+  min_n(range = c(2, 8)),
+  levels = 5
+)
+```
+
+Random Forest - Tune and update the parameters
+```{r}
+set.seed(345)
+tune_res <- tune_grid(
+  rf_wf,
+  resamples = folds,
+  grid = rf_grid
+)
+best_rmse <- select_best(tune_res, "rmse")
+final_rf <- finalize_model(
+  rf_mod,
+  best_rmse
+)
+rf_wf <- rf_wf %>%
+  update_model(final_rf)
+```
+Random Forest - Fit the model
+```{r}
+rf_fit <- fit(rf_wf, data = house_train)
+```
+Random Forest - Predict and find the RMSE 
+```{r}
+rf_pred <- rf_fit %>%
+  predict(new_data = house_test)
+rf_pred <- bind_cols(rf_pred, house_test %>% select(SalePrice))
+rf_pred
+rmse(rf_pred, truth = exp(SalePrice), estimate = exp(.pred))
+```
+Random Forest - Plot the predictions against the actual SalePrice and see if there any postProcesses that can be done.
+```{r}
+ggplot(data = rf_pred, aes(x = exp(.pred), y = exp(SalePrice))) +
+  geom_point()
+```
+Does not look like any postProcessing is needed.
+
+LASSO Model
+Same Process as with Random Forest
+```{r}
+lasso_model <- linear_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet")
+  
+
+lasso_wf <- workflow() %>%
+  add_recipe(house_rec) %>%
+  add_model(lasso_model)
+
+lasso_grid <- grid_regular(
+  penalty(), # The tune package has default values for penalty() and mixture() so no need to give them any
+  mixture(),
+  levels = 5
+)
+set.seed(345)
+tune_res_las <- tune_grid(
+  lasso_wf,
+  resamples = folds,
+  grid = lasso_grid
+)
+best_rmse_las <- select_best(tune_res_las, "rmse")
+final_las <- finalize_model(
+  lasso_model,
+  best_rmse_las
+)
+lasso_wf <- lasso_wf %>%
+  update_model(final_las)
+
+```
+LASSO - Fit the model
+```{r}
+lasso_fit <- fit(lasso_wf, data = house_train)
+```
+LASSO - Predict and evaluate using RMSE
+```{r}
+lasso_pred <- lasso_fit %>%
+  predict(new_data = house_test)
+lasso_pred <- bind_cols(lasso_pred, house_test %>% select(SalePrice))
+rmse(lasso_pred, truth = exp(SalePrice), estimate = exp(.pred))
+```
+LASSO - Check for any potential postProcessing
+```{r}
+ggplot(data = lasso_pred, aes(x = exp(.pred), y = exp(SalePrice))) +
+  geom_point()
+```
+Looks good, no postProcessing required
+
+MARS Model
+For the MARS model I am not going to use parameter tuning
+
+```{r}
+mars_model <- mars(mode = "regression") %>%
+  set_engine("earth")
+
+mars_wf <- workflow() %>%
+  add_recipe(house_rec) %>%
+  add_model(mars_model)
+
+mars_fit <- fit(mars_wf, data = house_train)
+
+```
+
+MARS - Prediction and evaluate using RMSE
+```{r}
+mars_pred <- mars_fit %>%
+  predict(new_data = house_test)
+mars_pred <- bind_cols(mars_pred, house_test %>% select(SalePrice))
+rmse(mars_pred, truth = exp(SalePrice), estimate = exp(.pred))
+```
+MARS - Check for any postProcessing
+```{r}
+ggplot(data = mars_pred, aes(x = exp(.pred), y = exp(SalePrice))) +
+  geom_point()
+```
+Looks good, no postProcessing required.
+
+Submission
+From the RMSE scores it looks like the LASSO model worked best so that is what I am going to use for the final prediction.
+```{r}
+lasso_final_fit <- fit(lasso_wf, data = train)
+lasso_final_pred <- predict(lasso_final_fit, new_data = test)
+lasso_final_pred <- bind_cols(test %>% select(Id), exp(lasso_final_pred))
+names(lasso_final_pred)[2] <- "SalePrice"
+
+write_csv(lasso_final_pred, "tidymodels_pred.csv")
+```
+This gave me a 0.13401 score on Kaggle.
